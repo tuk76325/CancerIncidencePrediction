@@ -1,0 +1,218 @@
+rm(list=ls())
+set.seed(123)
+install.packages("dplyr")
+install.packages("data.table")
+install.packages("tidyverse")
+install.packages("readxl")
+install.packages("janitor")
+install.packages("glmnet")
+library(dplyr)
+library(data.table)
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(glmnet)
+
+airQuality <- read_xlsx("ctyfactbook2023.xlsx", na="ND")
+education <- read_xlsx("Education2023.xlsx", skip=3)
+cancerIncd <- read.csv("incd.csv", skip=8, na="data not available ")
+places <- read.csv("PLACESTest.csv")
+population <- read_xlsx("PopulationEstimates.xlsx", skip=4)
+poverty <- read_xlsx("Poverty2023.xlsx", skip=4)
+unemployment <- read_xlsx("Unemployment2023.xlsx", skip=4)
+
+#determine how many counties the air quality dataset leaves out
+matchingCounties <- merge(x=airQuality, y=poverty, by.x="County FIPS Code", by.y="FIPS_Code")
+
+#Trim places dataset to only include age-adjusted cancer measures
+places <- places[places$MeasureId %like% c("CANCER"), ]
+places <- places[places$Data_Value_Type %like% c("Age-adjusted prevalence"), ]
+
+#Trim county names so that they can be joined to FIPS Code, then join FIPS code on places
+endNames <- c("City and Borough", "Census Area", "Municipality", 
+                  "Borough", "County", "Area", "Planning Region", "Parish", "city")
+
+
+regex <- paste(paste0("(^|\\s+)", endNames, "\\.?", "(?=\\s+|$)"),collapse="|")
+
+poverty <- poverty %>% 
+  mutate(Area_Name = str_remove_all(Area_Name, regex))
+
+countryCodeJoinDF <- subset(poverty, select=c("FIPS_Code", "Stabr", "Area_Name"))
+
+places <- countryCodeJoinDF %>%
+  inner_join(places,
+                    by = c("Stabr" = "StateAbbr", "Area_Name" = "LocationName"))
+                    
+#Column selection
+poverty <- subset(poverty,  select=c("FIPS_Code","PCTPOVALL_2023"))
+
+cancerIncd <- drop_na(cancerIncd)
+cancerIncd <- subset(cancerIncd, select=c("FIPS", "Age_Adjusted_Incidence_Rate_cases_per_100.000"))
+
+places <- subset(places, select=c("FIPS_Code", "Data_Value"))
+places <- places %>%
+  rename(
+   Age_adjusted_Cancer_or_melanoma_among_adults_rate = Data_Value
+)
+
+education <- subset(education, select=c("FIPS Code", "Percent of adults who are not high school graduates, 2019-23", "Percent of adults who are high school graduates (or equivalent), 2019-23", "Percent of adults completing some college or associate degree, 2019-23", "Percent of adults with a bachelor's degree or higher, 2019-23"))
+
+population <- subset(population, select=c("FIPStxt", "CENSUS_2020_POP"))
+
+unemployment <- subset(unemployment, select=c("FIPS_Code", "Unemployment_rate_2023", "Med_HH_Income_Percent_of_State_Total_2022"))
+
+#drop the first row (entire USA)
+cancerIncd <- cancerIncd[-c(1),]
+
+#replace spaces in column name w/ underscores
+education <- clean_names(education)
+
+#make FIPS code integers for joining purposes (and do the same to Cancer incd)
+education <- transform(education, fips_code = as.numeric(fips_code))
+places <- transform(places, FIPS_Code = as.numeric(FIPS_Code))
+poverty <- transform(poverty, FIPS_Code = as.numeric(FIPS_Code))
+unemployment <- transform(unemployment, FIPS_Code = as.numeric(FIPS_Code))
+population <- transform(population, FIPStxt = as.numeric(FIPStxt))
+
+#join to create dataset that the regression will run on
+joinedData <- merge(x=cancerIncd, y=education, by.x="FIPS", by.y="fips_code")
+joinedData <- merge(x=joinedData, y=places, by.x="FIPS", by.y="FIPS_Code")
+joinedData <- merge(x=joinedData, y=poverty, by.x="FIPS", by.y="FIPS_Code")
+joinedData <- merge(x=joinedData, y=unemployment, by.x="FIPS", by.y="FIPS_Code")
+joinedData <- merge(x=joinedData, y=population, by.x="FIPS", by.y="FIPStxt")
+
+#drop FIPS Code then scale data (except target variable because not necessary)
+joinedData <- joinedData[ , !(names(joinedData) %in% c("FIPS"))]
+sapply(joinedData, class)
+joinedData[, -c(1)] <- scale(joinedData[, -c(1)])
+sample <- sample(c(TRUE, FALSE), nrow(joinedData), replace=TRUE, prob=c(0.8,0.2))
+train  <- joinedData[sample, ]
+test   <- joinedData[!sample, ]
+
+
+xtrain <- train %>% select(-Age_Adjusted_Incidence_Rate_cases_per_100.000) 
+ytrain <- train$Age_Adjusted_Incidence_Rate_cases_per_100.000
+xtest <- test %>% select(-Age_Adjusted_Incidence_Rate_cases_per_100.000) 
+ytest <- test$Age_Adjusted_Incidence_Rate_cases_per_100.000
+
+#run elastic net regression
+lambda_array <- seq(from=0.01, to=100, by=0.01)
+elastic_net <- glmnet(xtrain, ytrain, alpha=0.5, lambda=lambda_array)
+summary(elastic_net)
+
+ypreds <- predict(elastic_net, s=min(lambda_array), newx=as.matrix(xtest))
+
+sstE <- sum((ytest- mean(ytest))^2)
+sseE <- sum((ypreds - ytest)^2)
+
+rSqE <- 1-(sseE/sstE)
+rSqE
+
+mseE <- (sum((ypreds - ytest)^2)) / (length(ypreds))
+mseE
+
+#elastic net with cross validation of 10 folds and lambda.min=lambda value w/ lowest MSE
+elastic_netCV <- cv.glmnet(as.matrix(xtrain), ytrain, alpha=0.5, lambda=lambda_array, nfolds=10)
+ypredsCV <- predict(elastic_netCV, s=elastic_netCV$lambda.min, newx=as.matrix(xtest))
+
+sstCV <- sum((ytest- mean(ytest))^2)
+sseCV <- sum((ypredsCV - ytest)^2)
+
+rSqCV <- 1-(sseCV/sstCV)
+rSqCV
+
+mseCV <- (sum((ypredsCV - ytest)^2)) / (length(ypredsCV))
+mseCV
+
+#elastic net with different alphas
+models <- list()
+
+for (i in 0:50) {
+  name <- paste0("alpha", i/50)
+  
+
+  models[[name]] <-
+    cv.glmnet(as.matrix(xtrain), ytrain, type.measure="mse", alpha=i/50, 
+              family="gaussian", nfolds=10)
+}
+
+results <- data.frame()
+for (i in 0:50) {
+  name <- paste0("alpha", i/50)
+  
+#   use each model to predict cancer incidence rate given the Testing dataset
+  predicted <- predict(models[[name]], 
+                       s=models[[name]]$lambda.min, newx=as.matrix(xtest))
+  
+#   calculate the Mean Squared Error and other measures
+  sstCV <- sum((ytest- mean(ytest))^2)
+  sseCV <- sum((predicted - ytest)^2)
+
+  rSqCV <- 1-(sseCV/sstCV)
+
+  mseCV <- (sum((predicted - ytest)^2)) / (length(ypredsCV))
+
+  
+#   store the results
+  temp <- data.frame(alpha=i/50, mse=mseCV, rSquared=rSqCV, name=name)
+  results <- rbind(results, temp)
+}
+
+#get alpha value that produces the smallest MSE and the largest rSq, then get coeffs
+orderedResults <- results[with(results, order(mse, rSquared)),]
+minAlpha <- orderedResults[1,4]
+predict(models[[minAlpha]], s="lambda.min", type = "coef")[1:10,]
+
+
+#multiple linear regression
+xyDF <- xtrain
+xyDF$cancerRate <- ytrain
+
+mlr <- lm(cancerRate~., data=xyDF)
+summary(mlr)
+
+mlrPreds <- predict(mlr, newdata=data.frame(xtest))
+
+sstMLR <- sum((ytest- mean(ytest))^2)
+sseMLR <- sum((mlrPreds - ytest)^2)
+
+rSqMLR <- 1-(sseMLR/sstMLR)
+
+mseMLR <- (sum((mlrPreds - ytest)^2)) / (length(mlrPreds))
+
+#output of all data
+cat("MLR", "\n", "MSE", mseMLR, "\n", "R-squared", rSqMLR, "\n")
+cat("CV Elastic Net w/ calculated alpha", "\n")
+orderedResults[1,]
+cat("10-fold CV Elastic Net alpha=0.5", "\n", "MSE", mseCV, "\n", "R-squared", rSqCV, "\n")
+cat("Elastic Net alpha=0.5", "\n", "MSE", mseE, "\n", "R-squared", rSqE)
+
+#coefficient path for each elastic net model
+plot(models[[minAlpha]]$glmnet.fit, xvar="lambda", label=TRUE)
+abline(v = log(models[[minAlpha]]$lambda.min), col = "red", lty = 2)
+title("Coefficient Path for 10-Fold 0.38-Alpha Elastic Net Regularization", line=3)
+coef_df = data.frame(as.matrix(coef(models[[minAlpha]], s = "lambda.min")))
+print(coef_df)
+
+plot(elastic_netCV$glmnet.fit, xvar="lambda", label=TRUE)
+abline(v = log(elastic_netCV$lambda.min), col = "red", lty = 2)
+title("Coefficient Path for 10-Fold 0.5-Alpha Elastic Net Regularization", line=3)
+coef_df2 = data.frame(as.matrix(coef(elastic_netCV, s = "lambda.min")))
+print(coef_df2)
+
+plot(elastic_net, xvar="lambda", label=TRUE)
+abline(v = log(min(lambda_array)), col = "red", lty = 2)
+title("Coefficient Path for 0.5-Alpha Elastic Net Regularization", line=3)
+coef_df3 = data.frame(as.matrix(coef(elastic_net, s = min(lambda_array))))
+print(coef_df3)
+
+#coefficient to dataframe
+coef_df$CoefficientsCVCalcAlpha <- coef_df$s1
+coef_df$CoefficientsCV <- coef_df2$s1
+coef_df$CoefficientsNoCV <- coef_df3$s1
+coef_df$s1 <- NULL
+
+#correlation coefficient showing strong negative correlation between household income and poverty rate
+cor(joinedData$PCTPOVALL_2023, joinedData$Med_HH_Income_Percent_of_State_Total_2022)
+
